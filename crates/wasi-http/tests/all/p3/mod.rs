@@ -358,6 +358,47 @@ async fn run_http_with_hooks<E: Into<Error> + 'static>(
         .await?
 }
 
+/// Like [`run_http_with_hooks`], but the guest's request is built by
+/// `Prepared::new`, as `ProxyHandler` does, rather than `Request::from_http`.
+#[cfg(feature = "component-model-async")]
+async fn run_http_prepared<E: Into<Error> + 'static>(
+    component_filename: &str,
+    req: http::Request<impl Body<Data = Bytes, Error = E> + Send + Sync + 'static>,
+    hooks: TestHooks,
+) -> wasmtime::Result<http::Response<Collected<Bytes>>> {
+    use wasmtime::AsContextMut as _;
+    use wasmtime_wasi_http::handler::{Prepared, Proxy};
+
+    let engine = test_programs_artifacts::engine(|config| {
+        config.wasm_backtrace_details(wasmtime::WasmBacktraceDetails::Enable);
+        config.wasm_component_model_async(true);
+    });
+    let component = Component::from_file(&engine, component_filename)?;
+
+    let mut store = Store::new(&engine, Ctx::with_hooks(hooks));
+
+    let mut linker = Linker::new(&engine);
+    wasmtime_wasi::p2::add_to_linker_async(&mut linker)
+        .context("failed to link `wasi:cli@0.2.x`")?;
+    wasmtime_wasi::p3::add_to_linker(&mut linker).context("failed to link `wasi:cli@0.3.x`")?;
+    wasmtime_wasi_http::p3::add_to_linker(&mut linker)
+        .context("failed to link `wasi:http@0.3.x`")?;
+    let proxy = Proxy::P3(Service::instantiate_async(&mut store, &component, &linker).await?);
+    let req = req.map(|body| body.map_err(Into::into).boxed_unsync());
+    let (tx, rx) = oneshot::channel();
+    let prepared = Prepared::new(store.as_context_mut(), &proxy, req, WasiHttpView::http, tx)?;
+    store
+        .run_concurrent(async |store| {
+            let (_, res) = try_join!(prepared.run(store, std::future::pending()), async {
+                let (parts, body) = rx.await??.into_parts();
+                let body = body.collect().await.context("failed to collect body")?;
+                wasmtime::error::Ok(http::Response::from_parts(parts, body))
+            })?;
+            Ok(res)
+        })
+        .await?
+}
+
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p3_http_outbound_request_get() -> wasmtime::Result<()> {
     let server = Server::http1(1)?;
@@ -1090,6 +1131,41 @@ async fn p3_http_extensions() -> Result<()> {
     )
     .await?
     .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(
+        response.extensions().get::<ResponseMarker>(),
+        Some(&ResponseMarker("from send_request")),
+    );
+
+    let outbound = request_rx.await.unwrap().unwrap();
+    assert_eq!(
+        outbound.extensions().get::<RequestMarker>(),
+        Some(&RequestMarker("from host")),
+    );
+
+    Ok(())
+}
+
+/// Like [`p3_http_extensions`], but the guest's request is built by
+/// `ProxyHandler` rather than `Request::from_http`.
+#[cfg(feature = "component-model-async")]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p3_http_extensions_proxy_handler() -> Result<()> {
+    // Unlike `Request::from_http`, `ProxyHandler` rejects HTTP/1.1 requests
+    // without a `Host` header.
+    let request = http::Request::builder()
+        .uri("http://localhost/")
+        .method(http::Method::GET)
+        .header("host", "localhost")
+        .extension(RequestMarker("from host"));
+
+    let (request_tx, request_rx) = oneshot::channel();
+    let response = run_http_prepared(
+        P3_HTTP_EXTENSIONS_COMPONENT,
+        request.body(Empty::new())?,
+        TestHooks::new(Some(request_tx)),
+    )
+    .await?;
     assert_eq!(response.status().as_u16(), 200);
     assert_eq!(
         response.extensions().get::<ResponseMarker>(),
